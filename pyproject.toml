@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "crafting_pkg"
 version = "1.0.0"
-description = "Crafting package for BallsDex"
+description = "Crafting package for BallsDex V3"
 readme = "README.md"
 license = { text = "MIT" }
 dependencies = [
