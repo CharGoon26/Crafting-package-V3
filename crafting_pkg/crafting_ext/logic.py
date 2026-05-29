@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from bd_models.models import Ball, BallInstance
+from bd_models.models import BallInstance
 
-from .models import CraftingGroupOption, CraftingIngredient, CraftingIngredientGroup, CraftingRecipe
+from ..models import CraftingGroupOption, CraftingIngredient, CraftingIngredientGroup, CraftingRecipe
 
 
 async def find_matching_recipes(ingredient_instance_ids: List[int]) -> List[CraftingRecipe]:
