@@ -13,7 +13,7 @@ Other than that, these remain as in the original package:
 
 ## Installation
 
-Add this to `config/extra.toml` in a BallsDex install:
+Add this to `config/extra.toml`
 
 ```toml
 [[ballsdex.packages]]
