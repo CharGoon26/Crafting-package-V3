@@ -1,6 +1,7 @@
 # BallsDex Crafting Package V3
 
 This package was originally written by Mitoooooooopo or @An Unknown Guy on discord.
+
 Minor changes by Chargoon26 were added:
 - /craft addbulk query:<query> - Add cards in bulk with query to specify
 - /craft removebulk query:<query> - Remove cards in bulk with query to specify
