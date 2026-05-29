@@ -13,8 +13,6 @@ Other than that, these remain as in the original package:
 - /craft recipes
 
 > [!IMPORTANT]
-> This package is intended for standard BallsDex installs and lightly modified forks that keep the `bd_models` app/models compatible.
-> It no longer depends on later `bd_models` migrations, so different migration counts should be fine.
 > Contact @bigfatbrimmy on discord for any bugs or errors or if the original package owner wants to take it down, please notify me.
 
 ## Installation
