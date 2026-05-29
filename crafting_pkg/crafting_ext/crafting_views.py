@@ -9,7 +9,7 @@ from bd_models.models import BallInstance, Player, TradeObject
 from settings.models import settings
 
 from .logic import determine_ingredient_usage, find_matching_recipes
-from .models import CraftingRecipe
+from ..models import CraftingRecipe
 from .session_manager import crafting_sessions
 
 if TYPE_CHECKING:
