@@ -12,6 +12,9 @@ Other than that, these remain as in the original package:
 - /craft add and /craft remove
 - /craft recipes
 
+> [!IMPORTANT]
+> Contact @bigfatbrimmy on discord for any bugs or errors or if the original package owner wants to take it down, please notify me.
+
 ## Installation
 
 Add this to `config/extra.toml`
