@@ -14,7 +14,7 @@ from ballsdex.core.utils.transformers import BallEnabledTransform, BallInstanceT
 from .crafting_utils import update_crafting_display
 from .crafting_views import CraftingView, RecipeSelect, BulkCraftView
 from .logic import can_craft_recipe, determine_ingredient_usage, find_matching_recipes
-from .models import CraftingGroupOption, CraftingIngredient, CraftingIngredientGroup, CraftingRecipe
+from ..models import CraftingGroupOption, CraftingIngredient, CraftingIngredientGroup, CraftingRecipe
 from .session_manager import crafting_sessions
 
 if TYPE_CHECKING:
