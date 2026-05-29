@@ -12,7 +12,7 @@ Add this to `config/extra.toml` in a BallsDex install:
 
 ```toml
 [[ballsdex.packages]]
-location = "git+https://github.com/your-name/ballsdex-crafting-package.git==1.0.0"
+location = "git+https://github.com/CharGoon26/Crafting-package-V3.git==1.0.0"
 path = "crafting_pkg"
 enabled = true
 ```
