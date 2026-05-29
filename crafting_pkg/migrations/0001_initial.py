@@ -7,7 +7,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
     initial = True
 
-    dependencies = [("bd_models", "0019_special_animation_support")]
+    dependencies = [("bd_models", "0001_initial")]
 
     operations = [
         migrations.CreateModel(
