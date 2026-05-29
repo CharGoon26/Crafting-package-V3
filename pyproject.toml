@@ -9,8 +9,8 @@ description = "Crafting package for BallsDex"
 readme = "README.md"
 license = { text = "MIT" }
 dependencies = [
-    "ballsdex>=3.0.0",
+
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-name/ballsdex-crafting-package"
+Homepage = "https://github.com/CharGoon26/Crafting-package-V3/tree/main"
