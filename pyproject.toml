@@ -5,12 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "crafting_pkg"
 version = "1.0.0"
-description = "Crafting package for BallsDex V3"
+description = "Crafting package for BallsDex"
 readme = "README.md"
 license = { text = "MIT" }
-dependencies = [
-
-]
+dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/CharGoon26/Crafting-package-V3/tree/main"
+Homepage = "https://github.com/CharGoon26/Crafting-package-V3"
+
+[tool.setuptools.packages.find]
+include = ["crafting_pkg*"]
