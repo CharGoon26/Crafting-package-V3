@@ -181,7 +181,28 @@ class RecipeStatus:
         else:
             lines.append("*(no ingredients)*")
         lines.append("🟢 Ready to craft" if self.ready else "🔴 Missing ingredients")
-        return "\n".join(lines)
+        text = "\n".join(lines)
+        if len(text) > 1024:
+            # Truncate the ingredient list to fit within Discord's 1024 char limit
+            status_line = lines[-1]
+            header = "Requires:\n"
+            max_ingredient_len = 1024 - len(header) - len(status_line) - 4  # 4 for "..." + newline
+            truncated = []
+            used = 0
+            for need in self.needs:
+                emoji = bot.get_emoji(need.emoji_id) if need.emoji_id else None
+                prefix = f"{emoji} " if emoji else ""
+                line = f"{prefix}{need.label}"
+                if used + len(line) + 1 > max_ingredient_len:
+                    remaining = len(self.needs) - len(truncated)
+                    truncated.append(f"...and {remaining} more")
+                    break
+                truncated.append(line)
+                used += len(line) + 1
+            if not truncated:
+                truncated = ["*(ingredients truncated)*"]
+            text = header + "\n".join(truncated) + "\n" + status_line
+        return text
 
 
 async def recipe_requirement_lines(recipe: CraftingRecipe, counts: Dict[int, int]) -> list[IngredientNeed]:
