@@ -12,8 +12,8 @@ from bd_models.models import BallInstance, Player
 from ballsdex.core.utils.transformers import BallEnabledTransform, BallInstanceTransform
 
 from .crafting_utils import update_crafting_display
-from .crafting_views import CraftingView, RecipeSelect, BulkCraftView
-from .logic import can_craft_recipe, determine_ingredient_usage, find_matching_recipes
+from .crafting_views import BulkCraftView, RecipeBrowserView
+from .logic import build_recipe_statuses, inventory_counts, load_craft_inventory
 from ..models import CraftingGroupOption, CraftingIngredient, CraftingIngredientGroup, CraftingRecipe
 from .session_manager import crafting_sessions
 
@@ -198,48 +198,35 @@ class Craft(commands.GroupCog, group_name="craft"):
         await interaction.response.defer()
         await update_crafting_display(interaction, user_id)
 
-    @app_commands.command(name="recipes", description="Show available crafting recipes.")
+    @app_commands.command(name="recipes", description="Browse recipes and quick-craft if you have the ingredients.")
     async def craft_recipes(
         self,
         interaction: discord.Interaction,
         countryball: Optional[BallEnabledTransform] = None,
     ):
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
+        recipe_qs = CraftingRecipe.objects.select_related("result").prefetch_related(
+            "ingredients__ingredient",
+            "ingredient_groups__options__ball",
+        )
         if countryball:
-            recipes = [r async for r in CraftingRecipe.objects.filter(result=countryball).select_related("result")]
+            recipes = [r async for r in recipe_qs.filter(result=countryball)]
             title = f"🔨 Recipes for {countryball.country}"
         else:
-            recipes = [r async for r in CraftingRecipe.objects.all().select_related("result")[:10]]
-            title = "🔨 Available Recipes (Top 10)"
+            recipes = [r async for r in recipe_qs]
+            title = "🔨 Crafting Recipes"
 
         if not recipes:
             await interaction.followup.send("❌ No recipes found.", ephemeral=True)
             return
 
-        embed = discord.Embed(title=title, color=0x0099FF)
+        player, _ = await Player.objects.aget_or_create(discord_id=interaction.user.id)
+        inventory = await load_craft_inventory(player)
+        counts = inventory_counts(inventory)
+        statuses = await build_recipe_statuses(recipes, counts)
+        statuses.sort(key=lambda s: (not s.ready, s.recipe.result.country.lower()))
 
-        for recipe in recipes:
-            desc = []
-            async for ing in recipe.ingredients.select_related("ingredient"):
-                if ing.ingredient_id:
-                    emoji = interaction.client.get_emoji(ing.ingredient.emoji_id)
-                    desc.append(f"{emoji} {ing.ingredient.country} x{ing.quantity}")
-            async for group in recipe.ingredient_groups.prefetch_related("options__ball"):
-                options_text = []
-                async for opt in group.options.select_related("ball"):
-                    emoji = interaction.client.get_emoji(opt.ball.emoji_id)
-                    options_text.append(f"{emoji} {opt.ball.country}")
-                desc.append(
-                    f"**{group.name}** (choose {group.required_count}): {' | '.join(options_text[:5])}"
-                )
-
-            result = recipe.result
-            result_emoji = interaction.client.get_emoji(result.emoji_id)
-            embed.add_field(
-                name=f"{result_emoji} {result.country}",
-                value="\n".join(desc) or "*(no ingredients)*",
-                inline=False,
-            )
-
-        await interaction.followup.send(embed=embed)
+        view = RecipeBrowserView(self.bot, player, statuses, title)
+        message = await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
+        view.message = message
