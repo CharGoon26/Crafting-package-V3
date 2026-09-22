@@ -1,19 +1,119 @@
 from __future__ import annotations
 
-import random
-from typing import TYPE_CHECKING
+import asyncio
+from typing import TYPE_CHECKING, Sequence
 
 import discord
 
 from bd_models.models import BallInstance, Player, TradeObject
-from settings.models import settings
 
-from .logic import determine_ingredient_usage, find_matching_recipes
+from .logic import (
+    RecipeStatus,
+    build_recipe_statuses,
+    compute_crafted_bonuses,
+    determine_ingredient_usage,
+    find_matching_recipes,
+    format_instance_line,
+    inventory_counts,
+    load_craft_inventory,
+)
 from ..models import CraftingRecipe
 from .session_manager import crafting_sessions
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
+
+
+async def perform_craft(
+    bot: "BallsDexBot",
+    player: Player,
+    interaction: discord.Interaction,
+    recipe: CraftingRecipe,
+    instance_ids: Sequence[int],
+) -> discord.Embed | str:
+    """Consume the given instances and create the crafted card. Returns an embed or an error."""
+    found: list[BallInstance] = []
+    async for instance in BallInstance.objects.filter(
+        id__in=list(instance_ids),
+        player=player,
+        deleted=False,
+    ).select_related("ball", "special"):
+        if instance.locked:
+            return "One of the selected cards is locked in a trade. Craft cancelled."
+        found.append(instance)
+
+    if len(found) != len(set(instance_ids)):
+        return "Some ingredients are no longer in your inventory. Craft cancelled."
+
+    instance_ids_to_delete = [b.id for b in found]
+    try:
+        await TradeObject.objects.filter(ballinstance_id__in=instance_ids_to_delete).adelete()
+    except Exception as e:
+        print(f"Error cleaning up trade objects: {e}")
+        return "Error cleaning up trade references. Craft cancelled."
+
+    try:
+        deleted_count, _ = await BallInstance.objects.filter(id__in=instance_ids_to_delete).adelete()
+        if deleted_count != len(instance_ids_to_delete):
+            return "Not all ingredients were properly consumed. Craft cancelled."
+    except Exception as e:
+        print(f"Error deleting ball instances: {e}")
+        return "Error consuming ingredients. Craft cancelled."
+
+    attack_bonus, health_bonus, inherited_from = compute_crafted_bonuses(found)
+    crafted_instance = await BallInstance.objects.acreate(
+        player=player,
+        ball=recipe.result,
+        health_bonus=health_bonus,
+        attack_bonus=attack_bonus,
+        server_id=interaction.guild_id,
+    )
+
+    total_sacrificed_attack = sum(b.attack_bonus for b in found)
+    total_sacrificed_health = sum(b.health_bonus for b in found)
+    ball_emoji = bot.get_emoji(recipe.result.emoji_id)
+    name = f"{ball_emoji} {recipe.result.country}"
+    inherit_note = (
+        f"top {len(inherited_from)}/{len(found)} ingredient"
+        f"{'s' if len(found) != 1 else ''} (best 50%)"
+    )
+
+    embed = discord.Embed(
+        title="✅ Crafting Successful!",
+        description=f"Successfully crafted **{name}** (ID: #{crafted_instance.pk:0X})!",
+        color=0x00FF00,
+    )
+    embed.add_field(
+        name="New Instance Stats",
+        value=(
+            f"**ATK:** {crafted_instance.attack_bonus:+d} | "
+            f"**HP:** {crafted_instance.health_bonus:+d}\n"
+            f"*Inherited from {inherit_note}*"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Ingredients Used",
+        value="\n".join(format_instance_line(bot, ball) for ball in found),
+        inline=False,
+    )
+    embed.add_field(
+        name="Total Stats of Ingredients",
+        value=f"**ATK:** {total_sacrificed_attack:+d} | **HP:** {total_sacrificed_health:+d}",
+        inline=False,
+    )
+
+    session = crafting_sessions.get(interaction.user.id)
+    if isinstance(session, dict) and session.get("ingredient_instances"):
+        remaining = [
+            iid for iid in session["ingredient_instances"] if iid not in instance_ids_to_delete
+        ]
+        session["ingredient_instances"] = remaining
+        if not remaining:
+            crafting_sessions.pop(interaction.user.id, None)
+
+    return embed
 
 
 class CraftingView(discord.ui.View):
@@ -113,106 +213,15 @@ class CraftingView(discord.ui.View):
                 )
                 return
 
-            ball_instances_to_delete = []
-            async for instance in BallInstance.objects.filter(
-                id__in=ingredients_to_use
-            ).select_related("ball", "special"):
-                ball_instances_to_delete.append(instance)
-
-            instance_ids_to_delete = [b.id for b in ball_instances_to_delete]
-
-            try:
-                await TradeObject.objects.filter(ballinstance_id__in=instance_ids_to_delete).adelete()
-            except Exception as e:
-                print(f"Error cleaning up trade objects: {e}")
+            result = await perform_craft(
+                self.bot, self.player, interaction, recipe, ingredients_to_use
+            )
+            if isinstance(result, str):
                 crafting_sessions.pop(interaction.user.id, None)
-                await interaction.response.send_message(
-                    "Error cleaning up trade references. Crafting session ended for security.",
-                    ephemeral=True,
-                )
+                await interaction.response.send_message(result, ephemeral=True)
                 return
 
-            try:
-                deleted_count, _ = await BallInstance.objects.filter(
-                    id__in=instance_ids_to_delete
-                ).adelete()
-                if deleted_count != len(instance_ids_to_delete):
-                    crafting_sessions.pop(interaction.user.id, None)
-                    await interaction.response.send_message(
-                        "Not all ingredients were properly consumed. Crafting session ended for security.",
-                        ephemeral=True,
-                    )
-                    return
-            except Exception as e:
-                print(f"Error deleting ball instances: {e}")
-                crafting_sessions.pop(interaction.user.id, None)
-                await interaction.response.send_message(
-                    "Error consuming ingredients. Crafting session ended for security.",
-                    ephemeral=True,
-                )
-                return
-
-            crafted_instance = await BallInstance.objects.acreate(
-                player=self.player,
-                ball=recipe.result,
-                health_bonus=random.randint(-settings.max_attack_bonus, settings.max_attack_bonus),
-                attack_bonus=random.randint(-settings.max_attack_bonus, settings.max_attack_bonus),
-                server_id=interaction.guild_id,
-            )
-
-            total_sacrificed_attack = sum(b.attack_bonus for b in ball_instances_to_delete)
-            total_sacrificed_health = sum(b.health_bonus for b in ball_instances_to_delete)
-
-            ball_emoji = self.bot.get_emoji(recipe.result.emoji_id)
-            name = f"{ball_emoji} {recipe.result.country}"
-
-            embed = discord.Embed(
-                title="✅ Crafting Successful!",
-                description=f"Successfully crafted **{name}** (ID: #{crafted_instance.pk:0X})!",
-                color=0x00FF00,
-            )
-            embed.add_field(
-                name="New Instance Stats",
-                value=f"**ATK:** {crafted_instance.attack_bonus:+d} | **HP:** {crafted_instance.health_bonus:+d}",
-                inline=False,
-            )
-
-            used_summary = []
-            for ball in ball_instances_to_delete:
-                b_emoji = self.bot.get_emoji(ball.ball.emoji_id)
-                special_text = f"{ball.special.emoji} " if ball.special_id else ""
-                used_summary.append(f"{b_emoji} {special_text}{ball.ball.country} (#{ball.pk:0X})")
-
-            embed.add_field(name="Ingredients Used", value="\n".join(used_summary), inline=False)
-            embed.add_field(
-                name="Total Stats of Ingredients",
-                value=f"**ATK:** {total_sacrificed_attack:+d} | **HP:** {total_sacrificed_health:+d}",
-                inline=False,
-            )
-
-            net_attack = crafted_instance.attack_bonus - total_sacrificed_attack
-            net_health = crafted_instance.health_bonus - total_sacrificed_health
-            if net_attack != 0 or net_health != 0:
-                embed.add_field(
-                    name="Net Change",
-                    value=f"**ATK:** {net_attack:+d} | **HP:** {net_health:+d}",
-                    inline=False,
-                )
-
-            await interaction.response.edit_message(embed=embed, view=None)
-
-            for iid in ingredients_to_use:
-                self.session_data["ingredient_instances"].discard(iid) if isinstance(
-                    self.session_data["ingredient_instances"], set
-                ) else (
-                    self.session_data["ingredient_instances"].remove(iid)
-                    if iid in self.session_data["ingredient_instances"]
-                    else None
-                )
-
-            if not self.session_data["ingredient_instances"]:
-                crafting_sessions.pop(interaction.user.id, None)
-
+            await interaction.response.edit_message(embed=result, view=None)
         except Exception as e:
             print(f"Unexpected error in execute_craft: {e}")
             crafting_sessions.pop(interaction.user.id, None)
@@ -245,6 +254,266 @@ class RecipeSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         recipe_index = int(self.values[0])
         await self.parent_view.execute_craft(interaction, self.recipes[recipe_index])
+
+
+class QuickCraftConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        bot: "BallsDexBot",
+        player: Player,
+        recipe: CraftingRecipe,
+        instances: list[BallInstance],
+        browser: "RecipeBrowserView",
+    ):
+        super().__init__(timeout=90)
+        self.bot = bot
+        self.player = player
+        self.recipe = recipe
+        self.instances = instances
+        self.browser = browser
+        self.authorized_user_id = player.discord_id
+        self._busy = False
+        self._lock = asyncio.Lock()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.authorized_user_id:
+            await interaction.response.send_message(
+                "❌ Only you can confirm this craft.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with self._lock:
+            if self._busy:
+                await interaction.response.defer()
+                return
+            self._busy = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(view=self)
+
+        result = await perform_craft(
+            self.bot,
+            self.player,
+            interaction,
+            self.recipe,
+            [inst.pk for inst in self.instances],
+        )
+        if isinstance(result, str):
+            await interaction.edit_original_response(
+                embed=discord.Embed(title="❌ Craft Cancelled", description=result, color=0xFF0000),
+                view=None,
+            )
+            return
+        await interaction.edit_original_response(embed=result, view=None)
+        await self.browser.refresh_after_craft()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(view=None)
+        await interaction.followup.send("Quick craft cancelled.", ephemeral=True)
+
+
+class RecipeBrowserView(discord.ui.View):
+    recipes_per_page = 5
+
+    def __init__(
+        self,
+        bot: "BallsDexBot",
+        player: Player,
+        statuses: list[RecipeStatus],
+        title: str,
+    ):
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.player = player
+        self.statuses = statuses
+        self.title = title
+        self.page = 0
+        self.message: discord.WebhookMessage | discord.Message | None = None
+        self._rebuild()
+
+    def _max_page(self) -> int:
+        return max(0, (len(self.statuses) - 1) // self.recipes_per_page)
+
+    def _page_statuses(self) -> list[RecipeStatus]:
+        start = self.page * self.recipes_per_page
+        return self.statuses[start : start + self.recipes_per_page]
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=self.title,
+            description=(
+                "Inventory is checked automatically. Use **Quick Craft** on a 🟢 recipe "
+                "to consume your lowest-stat copies."
+            ),
+            color=0x0099FF,
+        )
+        if not self.statuses:
+            embed.description = "No recipes found."
+            return embed
+
+        for status in self._page_statuses():
+            emoji = self.bot.get_emoji(status.recipe.result.emoji_id)
+            embed.add_field(
+                name=f"{emoji} {status.recipe.result.country}",
+                value=status.field_value(self.bot),
+                inline=False,
+            )
+        embed.set_footer(
+            text=f"Page {self.page + 1}/{self._max_page() + 1} • Specials and locked cards are skipped"
+        )
+        return embed
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        page = self._page_statuses()
+        ready = [s for s in page if s.ready]
+
+        if len(ready) == 1:
+            recipe = ready[0].recipe
+            label = f"🔨 Quick Craft: {recipe.result.country}"[:80]
+            button = discord.ui.Button(label=label, style=discord.ButtonStyle.success)
+
+            async def qc_callback(interaction: discord.Interaction, *, _recipe=recipe):
+                await self._start_quick_craft(interaction, _recipe)
+
+            button.callback = qc_callback
+            self.add_item(button)
+        elif ready:
+            options = []
+            for status in ready[:25]:
+                emoji = self.bot.get_emoji(status.recipe.result.emoji_id)
+                options.append(
+                    discord.SelectOption(
+                        label=f"Quick Craft: {status.recipe.result.country}"[:100],
+                        description=("Ready to craft" if status.ready else "Missing ingredients")[:100],
+                        value=str(status.recipe.pk),
+                        emoji=emoji,
+                    )
+                )
+            select = discord.ui.Select(
+                placeholder="🔨 Quick Craft a ready recipe…",
+                options=options,
+                min_values=1,
+                max_values=1,
+            )
+            select.callback = self._quick_craft_select
+            self.add_item(select)
+
+        prev_btn = discord.ui.Button(
+            label="◀️ Previous",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page == 0,
+        )
+        prev_btn.callback = self._prev
+        self.add_item(prev_btn)
+
+        page_btn = discord.ui.Button(
+            label=f"Page {self.page + 1}/{self._max_page() + 1}",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
+        )
+        self.add_item(page_btn)
+
+        next_btn = discord.ui.Button(
+            label="Next ▶️",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page >= self._max_page(),
+        )
+        next_btn.callback = self._next
+        self.add_item(next_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.player.discord_id:
+            await interaction.response.send_message(
+                "❌ This recipe browser belongs to someone else.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _prev(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _next(self, interaction: discord.Interaction):
+        self.page = min(self._max_page(), self.page + 1)
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _quick_craft_select(self, interaction: discord.Interaction):
+        values = (interaction.data or {}).get("values") or []
+        if not values:
+            await interaction.response.send_message("No recipe selected.", ephemeral=True)
+            return
+        recipe_id = int(values[0])
+        status = next((s for s in self.statuses if s.recipe.pk == recipe_id), None)
+        if not status or not status.ready:
+            await interaction.response.send_message("That recipe is no longer ready.", ephemeral=True)
+            return
+        await self._start_quick_craft(interaction, status.recipe)
+
+    async def _start_quick_craft(self, interaction: discord.Interaction, recipe: CraftingRecipe):
+        inventory = await load_craft_inventory(self.player)
+        chosen_ids = await determine_ingredient_usage(recipe, [inst.pk for inst in inventory])
+        if not chosen_ids:
+            await interaction.response.send_message(
+                "You no longer have the ingredients for this recipe.", ephemeral=True
+            )
+            return
+
+        chosen = [inst for inst in inventory if inst.pk in chosen_ids]
+        chosen.sort(key=lambda inst: chosen_ids.index(inst.pk))
+        predicted_atk, predicted_hp, inherited = compute_crafted_bonuses(chosen)
+        result_name = recipe.result.country
+        embed = discord.Embed(
+            title=f"Confirm Quick Craft: {result_name}",
+            description=f"Consume the following to craft **{result_name}**?",
+            color=0xF1C40F,
+        )
+        used_lines = [format_instance_line(self.bot, inst) for inst in chosen]
+        embed.add_field(
+            name="Ingredients Used",
+            value="\n".join(used_lines) if used_lines else "*none*",
+            inline=False,
+        )
+        embed.add_field(
+            name="Predicted stats (best 50% average)",
+            value=(
+                f"**ATK:** {predicted_atk:+d} | **HP:** {predicted_hp:+d}\n"
+                f"*Using {len(inherited)} of {len(chosen)} consumed cards*"
+            ),
+            inline=False,
+        )
+        view = QuickCraftConfirmView(self.bot, self.player, recipe, chosen, self)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    async def refresh_after_craft(self) -> None:
+        inventory = await load_craft_inventory(self.player)
+        counts = inventory_counts(inventory)
+        recipes = [s.recipe for s in self.statuses]
+        self.statuses = await build_recipe_statuses(recipes, counts)
+        self.page = min(self.page, self._max_page())
+        self._rebuild()
+        if self.message:
+            try:
+                await self.message.edit(embed=self.build_embed(), view=self)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                pass
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                pass
 
 
 class BulkCraftView(discord.ui.View):
