@@ -318,6 +318,83 @@ class QuickCraftConfirmView(discord.ui.View):
         await interaction.followup.send("Quick craft cancelled.", ephemeral=True)
 
 
+class RecipeConfirmView(discord.ui.View):
+    """Shown after a recipe is selected from the dropdown. Shows requirements and confirm/cancel."""
+
+    def __init__(
+        self,
+        bot: "BallsDexBot",
+        player: Player,
+        recipe: CraftingRecipe,
+        ready: bool,
+        browser: "RecipeBrowserView",
+    ):
+        super().__init__(timeout=90)
+        self.bot = bot
+        self.player = player
+        self.recipe = recipe
+        self.ready = ready
+        self.browser = browser
+        self.authorized_user_id = player.discord_id
+        self._busy = False
+        self._lock = asyncio.Lock()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.authorized_user_id:
+            await interaction.response.send_message(
+                "❌ Only you can interact with this recipe.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="🔨 Craft", style=discord.ButtonStyle.success, disabled=True)
+    async def craft_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with self._lock:
+            if self._busy:
+                await interaction.response.defer()
+                return
+            self._busy = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(view=self)
+
+        inventory = await load_craft_inventory(self.player)
+        chosen_ids = await determine_ingredient_usage(self.recipe, [inst.pk for inst in inventory])
+        if not chosen_ids:
+            await interaction.edit_original_response(
+                embed=discord.Embed(
+                    title="❌ Craft Failed",
+                    description="You no longer have the required ingredients.",
+                    color=0xFF0000,
+                ),
+                view=None,
+            )
+            return
+
+        result = await perform_craft(
+            self.bot,
+            self.player,
+            interaction,
+            self.recipe,
+            chosen_ids,
+        )
+        if isinstance(result, str):
+            await interaction.edit_original_response(
+                embed=discord.Embed(title="❌ Craft Failed", description=result, color=0xFF0000),
+                view=None,
+            )
+            return
+        await interaction.edit_original_response(embed=result, view=None)
+        await self.browser.refresh_after_craft()
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(view=None)
+        await interaction.followup.send("Crafting cancelled.", ephemeral=True)
+
+
 class RecipeBrowserView(discord.ui.View):
     recipes_per_page = 5
 
@@ -348,8 +425,8 @@ class RecipeBrowserView(discord.ui.View):
         embed = discord.Embed(
             title=self.title,
             description=(
-                "Inventory is checked automatically. Use **Quick Craft** on a 🟢 recipe "
-                "to consume your lowest-stat copies."
+                "Select a recipe from the dropdown below to see its requirements. "
+                "Ready recipes will have a 🟢 indicator."
             ),
             color=0x0099FF,
         )
@@ -357,53 +434,44 @@ class RecipeBrowserView(discord.ui.View):
             embed.description = "No recipes found."
             return embed
 
+        lines = []
         for status in self._page_statuses():
-            emoji = self.bot.get_emoji(status.recipe.result.emoji_id)
-            embed.add_field(
-                name=f"{emoji} {status.recipe.result.country}",
-                value=status.field_value(self.bot),
-                inline=False,
-            )
+            emoji = self.bot.get_emoji(status.recipe.result.emoji_id) or ""
+            ready_mark = "🟢" if status.ready else "🔴"
+            lines.append(f"{ready_mark} {emoji} {status.recipe.result.country}")
+        embed.add_field(
+            name="Recipes on this page",
+            value="\n".join(lines) if lines else "None",
+            inline=False,
+        )
         embed.set_footer(
-            text=f"Page {self.page + 1}/{self._max_page() + 1} • Specials and locked cards are skipped"
+            text=f"Page {self.page + 1}/{self._max_page() + 1} • Select a recipe to view requirements"
         )
         return embed
 
     def _rebuild(self) -> None:
         self.clear_items()
         page = self._page_statuses()
-        ready = [s for s in page if s.ready]
 
-        if len(ready) == 1:
-            recipe = ready[0].recipe
-            label = f"🔨 Quick Craft: {recipe.result.country}"[:80]
-            button = discord.ui.Button(label=label, style=discord.ButtonStyle.success)
-
-            async def qc_callback(interaction: discord.Interaction, *, _recipe=recipe):
-                await self._start_quick_craft(interaction, _recipe)
-
-            button.callback = qc_callback
-            self.add_item(button)
-        elif ready:
-            options = []
-            for status in ready[:25]:
-                emoji = self.bot.get_emoji(status.recipe.result.emoji_id)
-                options.append(
-                    discord.SelectOption(
-                        label=f"Quick Craft: {status.recipe.result.country}"[:100],
-                        description=("Ready to craft" if status.ready else "Missing ingredients")[:100],
-                        value=str(status.recipe.pk),
-                        emoji=emoji,
-                    )
+        options = []
+        for status in page:
+            emoji = self.bot.get_emoji(status.recipe.result.emoji_id)
+            ready_mark = "🟢 " if status.ready else "🔴 "
+            options.append(
+                discord.SelectOption(
+                    label=f"{ready_mark}{status.recipe.result.country}"[:100],
+                    value=str(status.recipe.pk),
+                    emoji=emoji,
                 )
-            select = discord.ui.Select(
-                placeholder="🔨 Quick Craft a ready recipe…",
-                options=options,
-                min_values=1,
-                max_values=1,
             )
-            select.callback = self._quick_craft_select
-            self.add_item(select)
+        select = discord.ui.Select(
+            placeholder="Choose a recipe to view requirements…",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+        select.callback = self._recipe_select
+        self.add_item(select)
 
         prev_btn = discord.ui.Button(
             label="◀️ Previous",
@@ -446,6 +514,43 @@ class RecipeBrowserView(discord.ui.View):
         self._rebuild()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
+    async def _recipe_select(self, interaction: discord.Interaction):
+        values = (interaction.data or {}).get("values") or []
+        if not values:
+            await interaction.response.send_message("No recipe selected.", ephemeral=True)
+            return
+        recipe_id = int(values[0])
+        status = next((s for s in self.statuses if s.recipe.pk == recipe_id), None)
+        if not status:
+            await interaction.response.send_message("That recipe no longer exists.", ephemeral=True)
+            return
+
+        emoji = self.bot.get_emoji(status.recipe.result.emoji_id) or ""
+        ready_mark = "🟢 Ready to craft" if status.ready else "🔴 Missing ingredients"
+        embed = discord.Embed(
+            title=f"{emoji} {status.recipe.result.country}",
+            description=ready_mark,
+            color=0x00FF00 if status.ready else 0xFF0000,
+        )
+        lines = []
+        if status.needs:
+            for need in status.needs:
+                emoji = self.bot.get_emoji(need.emoji_id) if need.emoji_id else None
+                prefix = f"{emoji} " if emoji else ""
+                lines.append(f"{prefix}{need.label}")
+        else:
+            lines.append("*(no ingredients)*")
+        embed.add_field(name="Requires", value="\n".join(lines), inline=False)
+        if status.ready:
+            embed.add_field(
+                name="What happens",
+                value="Your lowest-stat copies of the required ingredients will be consumed.",
+                inline=False,
+            )
+
+        view = RecipeConfirmView(self.bot, self.player, status.recipe, status.ready, self)
+        await interaction.response.edit_message(embed=embed, view=view)
+
     async def _quick_craft_select(self, interaction: discord.Interaction):
         values = (interaction.data or {}).get("values") or []
         if not values:
@@ -477,9 +582,25 @@ class RecipeBrowserView(discord.ui.View):
             color=0xF1C40F,
         )
         used_lines = [format_instance_line(self.bot, inst) for inst in chosen]
+        used_text = "\n".join(used_lines) if used_lines else "*none*"
+        if len(used_text) > 1024:
+            status_line = f"*Using {len(inherited)} of {len(chosen)} consumed cards*"
+            max_len = 1024 - len(status_line) - 4
+            truncated = []
+            used = 0
+            for line in used_lines:
+                if used + len(line) + 1 > max_len:
+                    remaining = len(used_lines) - len(truncated)
+                    truncated.append(f"...and {remaining} more")
+                    break
+                truncated.append(line)
+                used += len(line) + 1
+            if not truncated:
+                truncated = ["*(ingredients truncated)*"]
+            used_text = "\n".join(truncated) + "\n" + status_line
         embed.add_field(
             name="Ingredients Used",
-            value="\n".join(used_lines) if used_lines else "*none*",
+            value=used_text,
             inline=False,
         )
         embed.add_field(
