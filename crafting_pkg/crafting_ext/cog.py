@@ -204,7 +204,7 @@ class Craft(commands.GroupCog, group_name="craft"):
         interaction: discord.Interaction,
         countryball: Optional[BallEnabledTransform] = None,
     ):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
 
         recipe_qs = CraftingRecipe.objects.select_related("result").prefetch_related(
             "ingredients__ingredient",
@@ -228,5 +228,5 @@ class Craft(commands.GroupCog, group_name="craft"):
         statuses.sort(key=lambda s: (not s.ready, s.recipe.result.country.lower()))
 
         view = RecipeBrowserView(self.bot, player, statuses, title)
-        message = await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
+        message = await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=False)
         view.message = message
