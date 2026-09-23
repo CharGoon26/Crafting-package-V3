@@ -151,7 +151,17 @@ class CraftingView(discord.ui.View):
         if len(possible_recipes) > 1:
             await self.show_recipe_selection(interaction, possible_recipes)
         else:
-            await self.execute_craft(interaction, possible_recipes[0])
+            confirm_view = CraftConfirmView(interaction, self, possible_recipes[0])
+            await interaction.response.send_message(
+                f"⚠️ Are you sure you want to craft **{possible_recipes[0].result.country}**?",
+                embed=discord.Embed(
+                    title="Confirm Craft",
+                    description="This will consume the required ingredients. This action cannot be undone.",
+                    color=0xFFA500,
+                ),
+                view=confirm_view,
+                ephemeral=True,
+            )
         self.stop()
 
     @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger)
@@ -253,7 +263,18 @@ class RecipeSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         recipe_index = int(self.values[0])
-        await self.parent_view.execute_craft(interaction, self.recipes[recipe_index])
+        recipe = self.recipes[recipe_index]
+        confirm_view = CraftConfirmView(interaction, lambda i: self.parent_view.execute_craft(i, recipe))
+        await interaction.response.send_message(
+            f"⚠️ Are you sure you want to craft **{recipe.result.country}**?",
+            embed=discord.Embed(
+                title="Confirm Craft",
+                description="This will consume the required ingredients. This action cannot be undone.",
+                color=0xFFA500,
+            ),
+            view=confirm_view,
+            ephemeral=True,
+        )
 
 
 class QuickCraftConfirmView(discord.ui.View):
@@ -283,17 +304,14 @@ class QuickCraftConfirmView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def execute_craft(self, interaction: discord.Interaction):
         async with self._lock:
             if self._busy:
-                await interaction.response.defer()
                 return
             self._busy = True
         self.stop()
         for item in self.children:
             item.disabled = True  # type: ignore[attr-defined]
-        await interaction.response.edit_message(view=self)
 
         result = await perform_craft(
             self.bot,
@@ -311,11 +329,58 @@ class QuickCraftConfirmView(discord.ui.View):
         await interaction.edit_original_response(embed=result, view=None)
         await self.browser.refresh_after_craft()
 
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        confirm_view = CraftConfirmView(interaction, self.execute_craft)
+        await interaction.response.send_message(
+            f"⚠️ Are you sure you want to craft **{self.recipe.result.country}**?",
+            embed=discord.Embed(
+                title="Confirm Quick Craft",
+                description="This will consume the required ingredients. This action cannot be undone.",
+                color=0xFFA500,
+            ),
+            view=confirm_view,
+            ephemeral=True,
+        )
+
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.edit_message(view=None)
         await interaction.followup.send("Quick craft cancelled.", ephemeral=True)
+
+
+class CraftConfirmView(discord.ui.View):
+    """Ephemeral confirmation shown when the user clicks Craft."""
+
+    def __init__(self, interaction: discord.Interaction, on_confirm: callable):
+        super().__init__(timeout=30)
+        self.interaction = interaction
+        self.on_confirm = on_confirm
+        self.authorized_user_id = interaction.user.id
+        self.confirmed = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.authorized_user_id:
+            await interaction.response.send_message("❌ Only you can confirm this craft.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+        await self.on_confirm(interaction)
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="❌ Craft cancelled.", view=self)
+        self.stop()
 
 
 class RecipeConfirmView(discord.ui.View):
@@ -352,17 +417,14 @@ class RecipeConfirmView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="🔨 Craft", style=discord.ButtonStyle.success)
-    async def craft_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def execute_craft(self, interaction: discord.Interaction):
         async with self._lock:
             if self._busy:
-                await interaction.response.defer()
                 return
             self._busy = True
         self.stop()
         for item in self.children:
             item.disabled = True  # type: ignore[attr-defined]
-        await interaction.response.edit_message(view=self)
 
         inventory = await load_craft_inventory(self.player)
         chosen_ids = await determine_ingredient_usage(self.recipe, [inst.pk for inst in inventory])
@@ -393,6 +455,25 @@ class RecipeConfirmView(discord.ui.View):
         await interaction.edit_original_response(embed=result, view=None)
         await self.browser.refresh_after_craft()
 
+    @discord.ui.button(label="🔨 Craft", style=discord.ButtonStyle.success)
+    async def craft_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.ready:
+            await interaction.response.send_message(
+                "❌ You don't have the required ingredients yet.", ephemeral=True
+            )
+            return
+        confirm_view = CraftConfirmView(interaction, self.execute_craft)
+        await interaction.response.send_message(
+            f"⚠️ Are you sure you want to craft **{self.recipe.result.country}**?",
+            embed=discord.Embed(
+                title="Confirm Craft",
+                description="This will consume the required ingredients. This action cannot be undone.",
+                color=0xFFA500,
+            ),
+            view=confirm_view,
+            ephemeral=True,
+        )
+
     @discord.ui.button(label="◀️ Back", style=discord.ButtonStyle.secondary)
     async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
@@ -409,7 +490,7 @@ class RecipeConfirmView(discord.ui.View):
 
 
 class RecipeBrowserView(discord.ui.View):
-    recipes_per_page = 5
+    recipes_per_page = 10
 
     def __init__(
         self,
@@ -434,6 +515,15 @@ class RecipeBrowserView(discord.ui.View):
         start = self.page * self.recipes_per_page
         return self.statuses[start : start + self.recipes_per_page]
 
+    def _recipe_emoji(self, status: RecipeStatus) -> str:
+        """Get the emoji for a recipe result, or empty string if none is available."""
+        emoji_id = status.recipe.result.emoji_id
+        if emoji_id:
+            custom = self.bot.get_emoji(emoji_id)
+            if custom:
+                return str(custom)
+        return ""
+
     def build_embed(self) -> discord.Embed:
         embed = discord.Embed(
             title=self.title,
@@ -449,9 +539,10 @@ class RecipeBrowserView(discord.ui.View):
 
         lines = []
         for status in self._page_statuses():
-            emoji = self.bot.get_emoji(status.recipe.result.emoji_id) or ""
+            emoji = self._recipe_emoji(status)
             ready_mark = "🟢" if status.ready else "🔴"
-            lines.append(f"{ready_mark} {emoji} {status.recipe.result.country}")
+            name = status.recipe.result.country
+            lines.append(f"{ready_mark} {emoji} {name}" if emoji else f"{ready_mark} {name}")
         embed.add_field(
             name="Recipes on this page",
             value="\n".join(lines) if lines else "None",
@@ -468,15 +559,15 @@ class RecipeBrowserView(discord.ui.View):
 
         options = []
         for status in page:
-            emoji = self.bot.get_emoji(status.recipe.result.emoji_id)
+            emoji = self._recipe_emoji(status)
             ready_mark = "🟢 " if status.ready else "🔴 "
-            options.append(
-                discord.SelectOption(
-                    label=f"{ready_mark}{status.recipe.result.country}"[:100],
-                    value=str(status.recipe.pk),
-                    emoji=emoji,
-                )
-            )
+            option_kwargs = {
+                "label": f"{ready_mark}{status.recipe.result.country}"[:100],
+                "value": str(status.recipe.pk),
+            }
+            if emoji:
+                option_kwargs["emoji"] = emoji
+            options.append(discord.SelectOption(**option_kwargs))
         select = discord.ui.Select(
             placeholder="Choose a recipe to view requirements…",
             options=options,
@@ -553,28 +644,26 @@ class RecipeBrowserView(discord.ui.View):
             await interaction.response.send_message("That recipe no longer exists.", ephemeral=True)
             return
 
-        emoji = self.bot.get_emoji(status.recipe.result.emoji_id) or ""
+        emoji = self._recipe_emoji(status)
         ready_mark = "🟢 Ready to craft" if status.ready else "🔴 Missing ingredients"
+        title = f"{emoji} {status.recipe.result.country}" if emoji else status.recipe.result.country
         embed = discord.Embed(
-            title=f"{emoji} {status.recipe.result.country}",
+            title=title,
             description=ready_mark,
             color=0x00FF00 if status.ready else 0xFF0000,
         )
         lines = []
         if status.needs:
             for need in status.needs:
-                emoji = self.bot.get_emoji(need.emoji_id) if need.emoji_id else None
-                prefix = f"{emoji} " if emoji else ""
-                lines.append(f"{prefix}{need.label}")
+                lines.append(need.label)
         else:
             lines.append("*(no ingredients)*")
-        embed.add_field(name="Requires", value="\n".join(lines), inline=False)
-        if status.ready:
-            embed.add_field(
-                name="What happens",
-                value="Your lowest-stat copies of the required ingredients will be consumed.",
-                inline=False,
-            )
+
+        # Show all ingredients in a single field, truncating only if needed to stay under 1024 chars
+        value = "\n".join(lines)
+        if len(value) > 1021:
+            value = value[:1021] + "..."
+        embed.add_field(name="Requires", value=value, inline=False)
 
         view = RecipeConfirmView(self.bot, self.player, status.recipe, status.ready, self)
         await interaction.response.edit_message(embed=embed, view=view)
