@@ -338,6 +338,11 @@ class RecipeConfirmView(discord.ui.View):
         self.authorized_user_id = player.discord_id
         self._busy = False
         self._lock = asyncio.Lock()
+        # Enable the Craft button only if the recipe is ready
+        for item in self.children:
+            if getattr(item, "label", None) == "🔨 Craft":
+                item.disabled = not ready
+                break
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.authorized_user_id:
@@ -347,7 +352,7 @@ class RecipeConfirmView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="🔨 Craft", style=discord.ButtonStyle.success, disabled=True)
+    @discord.ui.button(label="🔨 Craft", style=discord.ButtonStyle.success)
     async def craft_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         async with self._lock:
             if self._busy:
@@ -388,6 +393,14 @@ class RecipeConfirmView(discord.ui.View):
         await interaction.edit_original_response(embed=result, view=None)
         await self.browser.refresh_after_craft()
 
+    @discord.ui.button(label="◀️ Back", style=discord.ButtonStyle.secondary)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(
+            embed=self.browser.build_embed(),
+            view=self.browser,
+        )
+
     @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
@@ -405,7 +418,7 @@ class RecipeBrowserView(discord.ui.View):
         statuses: list[RecipeStatus],
         title: str,
     ):
-        super().__init__(timeout=180)
+        super().__init__(timeout=600)
         self.bot = bot
         self.player = player
         self.statuses = statuses
@@ -496,6 +509,10 @@ class RecipeBrowserView(discord.ui.View):
         next_btn.callback = self._next
         self.add_item(next_btn)
 
+        cancel_btn = discord.ui.Button(label="❌ Close", style=discord.ButtonStyle.danger)
+        cancel_btn.callback = self._close
+        self.add_item(cancel_btn)
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.player.discord_id:
             await interaction.response.send_message(
@@ -503,6 +520,17 @@ class RecipeBrowserView(discord.ui.View):
             )
             return False
         return True
+
+    async def _close(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="Recipe Browser Closed",
+                description="The recipe browser has been closed.",
+                color=0x808080,
+            ),
+            view=None,
+        )
 
     async def _prev(self, interaction: discord.Interaction):
         self.page = max(0, self.page - 1)
