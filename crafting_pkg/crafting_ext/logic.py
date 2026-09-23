@@ -175,9 +175,7 @@ class RecipeStatus:
         lines = ["Requires:"]
         if self.needs:
             for need in self.needs:
-                emoji = bot.get_emoji(need.emoji_id) if need.emoji_id else None
-                prefix = f"{emoji} " if emoji else ""
-                lines.append(f"{prefix}{need.label}")
+                lines.append(need.label)
         else:
             lines.append("*(no ingredients)*")
         lines.append("🟢 Ready to craft" if self.ready else "🔴 Missing ingredients")
@@ -190,9 +188,7 @@ class RecipeStatus:
             truncated = []
             used = 0
             for need in self.needs:
-                emoji = bot.get_emoji(need.emoji_id) if need.emoji_id else None
-                prefix = f"{emoji} " if emoji else ""
-                line = f"{prefix}{need.label}"
+                line = need.label
                 if used + len(line) + 1 > max_ingredient_len:
                     remaining = len(self.needs) - len(truncated)
                     truncated.append(f"...and {remaining} more")
