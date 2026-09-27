@@ -151,9 +151,12 @@ class CraftingView(discord.ui.View):
         if len(possible_recipes) > 1:
             await self.show_recipe_selection(interaction, possible_recipes)
         else:
-            confirm_view = CraftConfirmView(interaction, self, possible_recipes[0])
+            recipe = possible_recipes[0]
+            confirm_view = CraftConfirmView(
+                interaction, lambda i: self.execute_craft(i, recipe)
+            )
             await interaction.response.send_message(
-                f"⚠️ Are you sure you want to craft **{possible_recipes[0].result.country}**?",
+                f"⚠️ Are you sure you want to craft **{recipe.result.country}**?",
                 embed=discord.Embed(
                     title="Confirm Craft",
                     description="This will consume the required ingredients. This action cannot be undone.",
@@ -162,7 +165,6 @@ class CraftingView(discord.ui.View):
                 view=confirm_view,
                 ephemeral=True,
             )
-        self.stop()
 
     @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger)
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -212,14 +214,54 @@ class CraftingView(discord.ui.View):
         view.add_item(select)
         await interaction.response.edit_message(embed=embed, view=view)
 
+    async def _edit_confirm(self, interaction: discord.Interaction, embed: discord.Embed):
+        """The confirmation view already responded, so edit that message instead."""
+        try:
+            await interaction.edit_original_response(embed=embed, view=None)
+        except discord.HTTPException:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def _refresh_main_display(self, interaction: discord.Interaction):
+        from .crafting_utils import update_crafting_display
+
+        message = self.session_data.get("message")
+        if message is None:
+            return
+        if crafting_sessions.get(interaction.user.id) is None:
+            try:
+                await message.edit(
+                    embed=discord.Embed(
+                        title="🔨 Crafting Session Ended",
+                        description="This crafting session is closed. Use `/craft begin` to start a new one.",
+                        color=0x808080,
+                    ),
+                    view=None,
+                )
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                pass
+            return
+        try:
+            await update_crafting_display(interaction, interaction.user.id)
+        except Exception as e:
+            print(f"Error refreshing crafting display: {e}")
+
     async def execute_craft(self, interaction: discord.Interaction, recipe: CraftingRecipe):
+        self.stop()
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+
         try:
             ingredients_to_use = await determine_ingredient_usage(
                 recipe, self.session_data["ingredient_instances"]
             )
             if not ingredients_to_use:
-                await interaction.response.send_message(
-                    "Unable to determine ingredient usage. This shouldn't happen!", ephemeral=True
+                await self._edit_confirm(
+                    interaction,
+                    discord.Embed(
+                        title="❌ Craft Failed",
+                        description="You no longer have the required ingredients.",
+                        color=0xFF0000,
+                    ),
                 )
                 return
 
@@ -228,21 +270,26 @@ class CraftingView(discord.ui.View):
             )
             if isinstance(result, str):
                 crafting_sessions.pop(interaction.user.id, None)
-                await interaction.response.send_message(result, ephemeral=True)
+                await self._edit_confirm(
+                    interaction,
+                    discord.Embed(title="❌ Craft Failed", description=result, color=0xFF0000),
+                )
+                await self._refresh_main_display(interaction)
                 return
 
-            await interaction.response.edit_message(embed=result, view=None)
+            await self._edit_confirm(interaction, result)
+            await self._refresh_main_display(interaction)
         except Exception as e:
             print(f"Unexpected error in execute_craft: {e}")
             crafting_sessions.pop(interaction.user.id, None)
-            try:
-                await interaction.response.send_message(
-                    "An unexpected error occurred during crafting. Please try again.", ephemeral=True
-                )
-            except discord.InteractionResponded:
-                await interaction.followup.send(
-                    "An unexpected error occurred during crafting. Please try again.", ephemeral=True
-                )
+            await self._edit_confirm(
+                interaction,
+                discord.Embed(
+                    title="❌ Craft Failed",
+                    description="An unexpected error occurred during crafting. Please try again.",
+                    color=0xFF0000,
+                ),
+            )
 
 
 class RecipeSelect(discord.ui.Select):
