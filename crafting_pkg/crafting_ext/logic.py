@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 from bd_models.models import BallInstance, Player
 from settings.models import settings
@@ -10,26 +10,29 @@ from settings.models import settings
 from ..models import CraftingRecipe
 
 
-async def find_matching_recipes(ingredient_instance_ids: List[int]) -> List[CraftingRecipe]:
-    """Find all recipes that can be crafted with the given ingredient instances."""
+async def find_matching_recipes(ingredient_instance_ids: List[int]) -> Tuple[int, List[CraftingRecipe]]:
+    """Return (count, list of up to 5 matching recipes) that can be crafted with the given ingredient instances."""
     if not ingredient_instance_ids:
-        return []
+        return 0, []
 
     ball_counts: Dict[int, int] = {}
     async for instance in BallInstance.objects.filter(id__in=ingredient_instance_ids).select_related("ball"):
         ball_id = instance.ball_id
         ball_counts[ball_id] = ball_counts.get(ball_id, 0) + 1
 
-    matching = []
+    count = 0
+    matching: List[CraftingRecipe] = []
     async for recipe in CraftingRecipe.objects.prefetch_related(
         "ingredients__ingredient",
         "ingredient_groups__options__ball",
         "result",
     ):
         if await can_craft_recipe(recipe, ball_counts):
-            matching.append(recipe)
+            count += 1
+            if len(matching) < 5:
+                matching.append(recipe)
 
-    return matching
+    return count, matching
 
 
 async def can_craft_recipe(recipe: CraftingRecipe, available_ball_counts: Dict[int, int]) -> bool:
@@ -138,9 +141,9 @@ def compute_crafted_bonuses(instances: Sequence[BallInstance]) -> tuple[int, int
     return attack, health, chosen
 
 
-async def load_craft_inventory(player: Player) -> list[BallInstance]:
-    """Unlocked, non-special cards eligible for crafting."""
-    items: list[BallInstance] = []
+async def load_craft_inventory(player: Player) -> dict[int, int]:
+    """Return a dict mapping ball_id to count of unlocked, non-special, not locked BallInstances for the player."""
+    counts: dict[int, int] = {}
     async for inst in BallInstance.objects.filter(
         player=player,
         deleted=False,
@@ -148,8 +151,21 @@ async def load_craft_inventory(player: Player) -> list[BallInstance]:
     ).select_related("ball", "special"):
         if inst.locked:
             continue
-        items.append(inst)
-    return items
+        ball_id = inst.ball_id
+        counts[ball_id] = counts.get(ball_id, 0) + 1
+    return counts
+
+
+async def load_craft_instances(player: Player) -> list[int]:
+    """Return BallInstance IDs eligible for crafting (unlocked, non-special, not deleted)."""
+    return [
+        inst_id async for inst_id in BallInstance.objects.filter(
+            player=player,
+            deleted=False,
+            special__isnull=True,
+            locked__isnull=True,
+        ).values_list("id", flat=True)
+    ]
 
 
 def inventory_counts(instances: Sequence[BallInstance]) -> Dict[int, int]:
@@ -242,8 +258,9 @@ async def build_recipe_statuses(
 
 def format_instance_line(bot, inst: BallInstance) -> str:
     emoji = bot.get_emoji(inst.ball.emoji_id)
+    emoji_str = str(emoji) if emoji else ''
     special_text = f"{inst.special.emoji} " if inst.special_id else ""
     return (
-        f"{emoji} {special_text}{inst.ball.country} #{inst.pk:0X} "
+        f"{emoji_str} {special_text}{inst.ball.country} #{inst.pk:0X} "
         f"(ATK: {inst.attack_bonus:+d}, HP: {inst.health_bonus:+d})"
     )
