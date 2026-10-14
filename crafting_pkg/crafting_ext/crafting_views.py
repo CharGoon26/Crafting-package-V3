@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING, Sequence
 
 import discord
 
 from bd_models.models import BallInstance, Player, TradeObject
 
+from ..models import CraftingRecipe
 from .logic import (
     RecipeStatus,
     build_recipe_statuses,
@@ -14,14 +16,17 @@ from .logic import (
     determine_ingredient_usage,
     find_matching_recipes,
     format_instance_line,
-    inventory_counts,
+    load_craft_instances,
     load_craft_inventory,
 )
-from ..models import CraftingRecipe
-from .session_manager import crafting_sessions
+from .session_manager import crafting_sessions, get_session
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
+
+    from .session_manager import CraftingSessionData
+
+log = logging.getLogger("ballsdex.packages.crafting")
 
 
 async def perform_craft(
@@ -49,15 +54,15 @@ async def perform_craft(
     try:
         await TradeObject.objects.filter(ballinstance_id__in=instance_ids_to_delete).adelete()
     except Exception as e:
-        print(f"Error cleaning up trade objects: {e}")
+        log.error("Error cleaning up trade objects: %s", e)
         return "Error cleaning up trade references. Craft cancelled."
 
     try:
-        deleted_count, _ = await BallInstance.objects.filter(id__in=instance_ids_to_delete).adelete()
-        if deleted_count != len(instance_ids_to_delete):
+        updated_count = await BallInstance.objects.filter(id__in=instance_ids_to_delete).aupdate(deleted=True)
+        if updated_count != len(instance_ids_to_delete):
             return "Not all ingredients were properly consumed. Craft cancelled."
     except Exception as e:
-        print(f"Error deleting ball instances: {e}")
+        log.error("Error soft-deleting ball instances: %s", e)
         return "Error consuming ingredients. Craft cancelled."
 
     attack_bonus, health_bonus, inherited_from = compute_crafted_bonuses(found)
@@ -72,7 +77,8 @@ async def perform_craft(
     total_sacrificed_attack = sum(b.attack_bonus for b in found)
     total_sacrificed_health = sum(b.health_bonus for b in found)
     ball_emoji = bot.get_emoji(recipe.result.emoji_id)
-    name = f"{ball_emoji} {recipe.result.country}"
+    ball_emoji_str = str(ball_emoji) if ball_emoji else ''
+    name = f"{ball_emoji_str} {recipe.result.country}".strip()
     inherit_note = (
         f"top {len(inherited_from)}/{len(found)} ingredient"
         f"{'s' if len(found) != 1 else ''} (best 50%)"
@@ -104,12 +110,12 @@ async def perform_craft(
         inline=False,
     )
 
-    session = crafting_sessions.get(interaction.user.id)
-    if isinstance(session, dict) and session.get("ingredient_instances"):
+    session = get_session(interaction.user.id)
+    if session and session.ingredient_instances:
         remaining = [
-            iid for iid in session["ingredient_instances"] if iid not in instance_ids_to_delete
+            iid for iid in session.ingredient_instances if iid not in instance_ids_to_delete
         ]
-        session["ingredient_instances"] = remaining
+        session.ingredient_instances = remaining
         if not remaining:
             crafting_sessions.pop(interaction.user.id, None)
 
@@ -117,7 +123,7 @@ async def perform_craft(
 
 
 class CraftingView(discord.ui.View):
-    def __init__(self, bot: "BallsDexBot", player: Player, session_data: dict):
+    def __init__(self, bot: "BallsDexBot", player: Player, session_data: "CraftingSessionData"):
         super().__init__(timeout=1200)
         self.bot = bot
         self.player = player
@@ -135,13 +141,13 @@ class CraftingView(discord.ui.View):
 
     @discord.ui.button(label="🔨 Craft", style=discord.ButtonStyle.success)
     async def craft_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.session_data["ingredient_instances"]:
+        if not self.session_data.ingredient_instances:
             await interaction.response.send_message(
                 "You haven't added any ingredients yet!", ephemeral=True
             )
             return
 
-        possible_recipes = await find_matching_recipes(self.session_data["ingredient_instances"])
+        _, possible_recipes = await find_matching_recipes(self.session_data.ingredient_instances)
         if not possible_recipes:
             await interaction.response.send_message(
                 "Your current ingredients don't match any known recipes!", ephemeral=True
@@ -180,8 +186,8 @@ class CraftingView(discord.ui.View):
     async def on_timeout(self):
         crafting_sessions.pop(self.player.discord_id, None)
         try:
-            if self.session_data.get("message"):
-                await self.session_data["message"].edit(
+            if self.session_data.message:
+                await self.session_data.message.edit(
                     embed=discord.Embed(
                         title="Crafting Timed Out",
                         description="Your crafting session expired after 20 minutes of inactivity.",
@@ -201,12 +207,13 @@ class CraftingView(discord.ui.View):
         options = []
         for i, recipe in enumerate(possible_recipes):
             emoji = self.bot.get_emoji(recipe.result.emoji_id)
+            emoji_for_option = emoji if emoji else None
             options.append(
                 discord.SelectOption(
                     label=recipe.result.country,
                     description=f"Craft {recipe.result.country}",
                     value=str(i),
-                    emoji=emoji,
+                    emoji=emoji_for_option,
                 )
             )
         select = RecipeSelect(options, possible_recipes, self, self.authorized_user_id)
@@ -224,7 +231,7 @@ class CraftingView(discord.ui.View):
     async def _refresh_main_display(self, interaction: discord.Interaction):
         from .crafting_utils import update_crafting_display
 
-        message = self.session_data.get("message")
+        message = self.session_data.message
         if message is None:
             return
         if crafting_sessions.get(interaction.user.id) is None:
@@ -243,7 +250,7 @@ class CraftingView(discord.ui.View):
         try:
             await update_crafting_display(interaction, interaction.user.id)
         except Exception as e:
-            print(f"Error refreshing crafting display: {e}")
+            log.error("Error refreshing crafting display: %s", e)
 
     async def execute_craft(self, interaction: discord.Interaction, recipe: CraftingRecipe):
         self.stop()
@@ -252,7 +259,7 @@ class CraftingView(discord.ui.View):
 
         try:
             ingredients_to_use = await determine_ingredient_usage(
-                recipe, self.session_data["ingredient_instances"]
+                recipe, self.session_data.ingredient_instances
             )
             if not ingredients_to_use:
                 await self._edit_confirm(
@@ -280,7 +287,7 @@ class CraftingView(discord.ui.View):
             await self._edit_confirm(interaction, result)
             await self._refresh_main_display(interaction)
         except Exception as e:
-            print(f"Unexpected error in execute_craft: {e}")
+            log.error("Unexpected error in execute_craft: %s", e)
             crafting_sessions.pop(interaction.user.id, None)
             await self._edit_confirm(
                 interaction,
@@ -473,8 +480,8 @@ class RecipeConfirmView(discord.ui.View):
         for item in self.children:
             item.disabled = True  # type: ignore[attr-defined]
 
-        inventory = await load_craft_inventory(self.player)
-        chosen_ids = await determine_ingredient_usage(self.recipe, [inst.pk for inst in inventory])
+        inventory = await load_craft_instances(self.player)
+        chosen_ids = await determine_ingredient_usage(self.recipe, inventory)
         if not chosen_ids:
             await interaction.edit_original_response(
                 embed=discord.Embed(
@@ -728,8 +735,8 @@ class RecipeBrowserView(discord.ui.View):
         await self._start_quick_craft(interaction, status.recipe)
 
     async def _start_quick_craft(self, interaction: discord.Interaction, recipe: CraftingRecipe):
-        inventory = await load_craft_inventory(self.player)
-        chosen_ids = await determine_ingredient_usage(recipe, [inst.pk for inst in inventory])
+        inventory = await load_craft_instances(self.player)
+        chosen_ids = await determine_ingredient_usage(recipe, inventory)
         if not chosen_ids:
             await interaction.response.send_message(
                 "You no longer have the ingredients for this recipe.", ephemeral=True
@@ -779,8 +786,7 @@ class RecipeBrowserView(discord.ui.View):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def refresh_after_craft(self) -> None:
-        inventory = await load_craft_inventory(self.player)
-        counts = inventory_counts(inventory)
+        counts = await load_craft_inventory(self.player)
         recipes = [s.recipe for s in self.statuses]
         self.statuses = await build_recipe_statuses(recipes, counts)
         self.page = min(self.page, self._max_page())
@@ -805,7 +811,7 @@ class BulkCraftView(discord.ui.View):
     def __init__(
         self,
         bot: "BallsDexBot",
-        session: dict,
+        session: "CraftingSessionData",
         mode: str,
         candidates: list[BallInstance],
     ):
@@ -830,7 +836,9 @@ class BulkCraftView(discord.ui.View):
         end = start + self.items_per_page
         return self.candidates[start:end]
 
-    def _resolve_event_emoji(self, inst: BallInstance) -> tuple[discord.PartialEmoji | discord.Emoji | None, str | None]:
+    def _resolve_event_emoji(
+        self, inst: BallInstance
+    ) -> tuple[discord.PartialEmoji | discord.Emoji | None, str | None]:
         """Return (emoji_obj, unicode_fallback) for a special card."""
         if not inst.special_id or not inst.special:
             return None, None
@@ -864,6 +872,7 @@ class BulkCraftView(discord.ui.View):
         options = []
         for inst in page_cards:
             emoji = self.bot.get_emoji(inst.ball.emoji_id)
+            emoji_for_option = emoji if emoji else None
             label = f"{inst.ball.country} #{inst.pk:0X}"
 
             event_emoji_obj, event_unicode = self._resolve_event_emoji(inst)
@@ -878,7 +887,7 @@ class BulkCraftView(discord.ui.View):
                     label=label[:100],
                     value=str(inst.pk),
                     description=desc[:100],
-                    emoji=emoji,
+                    emoji=emoji_for_option,
                     default=inst.pk in self.selected_ids,
                 )
             )
@@ -926,7 +935,10 @@ class BulkCraftView(discord.ui.View):
         )
         self.add_item(page_btn)
 
-        action_label = ("➕ Add Selected" if self.mode == "add" else "➖ Remove Selected") + f" ({len(self.selected_ids)})"
+        action_label = (
+            ("➕ Add Selected" if self.mode == "add" else "➖ Remove Selected")
+            + f" ({len(self.selected_ids)})"
+        )
         action_btn = discord.ui.Button(
             label=action_label,
             style=discord.ButtonStyle.success if self.mode == "add" else discord.ButtonStyle.danger,
@@ -965,15 +977,15 @@ class BulkCraftView(discord.ui.View):
 
         if self.mode == "add":
             for pk in self.selected_ids:
-                if pk not in self.session["ingredient_instances"]:
-                    self.session["ingredient_instances"].append(pk)
+                if pk not in self.session.ingredient_instances:
+                    self.session.ingredient_instances.append(pk)
         else:
-            self.session["ingredient_instances"] = [
-                pk for pk in self.session["ingredient_instances"] if pk not in self.selected_ids
+            self.session.ingredient_instances = [
+                pk for pk in self.session.ingredient_instances if pk not in self.selected_ids
             ]
 
         from .crafting_utils import update_crafting_display
-        if self.session.get("message"):
+        if self.session.message:
             await update_crafting_display(interaction, interaction.user.id)
         else:
             await update_crafting_display(interaction, interaction.user.id, is_new=True)
