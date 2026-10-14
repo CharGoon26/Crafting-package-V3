@@ -8,14 +8,14 @@ from asgiref.sync import sync_to_async
 from discord import app_commands
 from discord.ext import commands
 
-from bd_models.models import BallInstance, Player
 from ballsdex.core.utils.transformers import BallEnabledTransform, BallInstanceTransform
+from bd_models.models import BallInstance, Player
 
+from ..models import CraftingRecipe
 from .crafting_utils import update_crafting_display
 from .crafting_views import BulkCraftView, RecipeBrowserView
-from .logic import build_recipe_statuses, inventory_counts, load_craft_inventory
-from ..models import CraftingGroupOption, CraftingIngredient, CraftingIngredientGroup, CraftingRecipe
-from .session_manager import crafting_sessions
+from .logic import build_recipe_statuses, load_craft_inventory
+from .session_manager import create_session, get_session, session_exists, start_cleanup_task, stop_cleanup_task
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
@@ -27,6 +27,12 @@ class Craft(commands.GroupCog, group_name="craft"):
     def __init__(self, bot: "BallsDexBot"):
         self.bot = bot
 
+    async def cog_load(self):
+        await start_cleanup_task(interval=300)
+
+    async def cog_unload(self):
+        await stop_cleanup_task()
+
     @app_commands.command(name="begin", description="Start a crafting session.")
     async def craft_begin(
         self,
@@ -35,7 +41,7 @@ class Craft(commands.GroupCog, group_name="craft"):
         await interaction.response.defer()
         user_id = interaction.user.id
 
-        if user_id in crafting_sessions:
+        if session_exists(user_id):
             await interaction.followup.send(
                 "You already have an active crafting session. Please finish or cancel it first.",
                 ephemeral=True,
@@ -44,32 +50,38 @@ class Craft(commands.GroupCog, group_name="craft"):
 
         player, _ = await Player.objects.aget_or_create(discord_id=user_id)
 
-        crafting_sessions[user_id] = {
-            "player": player,
-            "ingredient_instances": [],
-            "started_at": discord.utils.utcnow(),
-            "message": None,
-        }
+        if not create_session(user_id, player, []):
+            await interaction.followup.send("❌ Failed to create crafting session.", ephemeral=True)
+            return
 
-        await update_crafting_display(interaction, user_id, is_new=True)
+        try:
+            await update_crafting_display(interaction, user_id, is_new=True)
+        except Exception as e:
+            log.error("Error updating crafting display after begin: %s", e)
+            try:
+                await interaction.followup.send(
+                    "❌ An error occurred while updating the crafting session.", ephemeral=True
+                )
+            except Exception:
+                pass
 
     @app_commands.command(name="addbulk", description="Bulk add cards to your crafting session.")
     async def craft_addbulk(self, interaction: discord.Interaction, query: str | None = None):
         await interaction.response.defer(ephemeral=True)
         user_id = interaction.user.id
 
-        if user_id not in crafting_sessions:
+        session = get_session(user_id)
+        if not session:
             await interaction.followup.send("❌ Start a crafting session first with `/craft begin`.", ephemeral=True)
             return
 
-        session = crafting_sessions[user_id]
-        player = session["player"]
+        player = session.player
 
         candidates = []
         async for inst in BallInstance.objects.filter(player=player, deleted=False).select_related("ball", "special"):
             if inst.locked:
                 continue
-            if inst.pk in session["ingredient_instances"]:
+            if inst.pk in session.ingredient_instances:
                 continue
             candidates.append(inst)
 
@@ -90,17 +102,19 @@ class Craft(commands.GroupCog, group_name="craft"):
         await interaction.response.defer(ephemeral=True)
         user_id = interaction.user.id
 
-        if user_id not in crafting_sessions:
+        session = get_session(user_id)
+        if not session:
             await interaction.followup.send("❌ No active crafting session!", ephemeral=True)
             return
 
-        session = crafting_sessions[user_id]
-        if not session["ingredient_instances"]:
+        if not session.ingredient_instances:
             await interaction.followup.send("❌ No ingredients to remove.", ephemeral=True)
             return
 
         candidates = []
-        async for inst in BallInstance.objects.filter(id__in=session["ingredient_instances"]).select_related("ball", "special"):
+        async for inst in BallInstance.objects.filter(
+            id__in=session.ingredient_instances
+        ).select_related("ball", "special"):
             candidates.append(inst)
 
         if query:
@@ -124,14 +138,14 @@ class Craft(commands.GroupCog, group_name="craft"):
         await interaction.response.defer(ephemeral=True)
         user_id = interaction.user.id
 
-        if user_id not in crafting_sessions:
+        session = get_session(user_id)
+        if not session:
             await interaction.followup.send(
                 "❌ Start a crafting session first with `/craft begin`.", ephemeral=True
             )
             return
 
-        session = crafting_sessions[user_id]
-        player = session["player"]
+        player = session.player
 
         if countryball.player_id != player.pk:
             await interaction.followup.send("❌ You don't own this card!", ephemeral=True)
@@ -144,7 +158,7 @@ class Craft(commands.GroupCog, group_name="craft"):
             )
             return
 
-        if countryball.pk in session["ingredient_instances"]:
+        if countryball.pk in session.ingredient_instances:
             await interaction.followup.send(
                 f"❌ Already added #{countryball.pk:0X}!", ephemeral=True
             )
@@ -153,11 +167,20 @@ class Craft(commands.GroupCog, group_name="craft"):
         await countryball.arefresh_from_db()
         ball = await sync_to_async(lambda: countryball.ball)()  # type: ignore
 
-        session["ingredient_instances"].append(countryball.pk)
+        session.ingredient_instances.append(countryball.pk)
         await interaction.followup.send(
             f"Added {ball.country} #{countryball.pk:0X} to crafting session!", ephemeral=True
         )
-        await update_crafting_display(interaction, user_id)
+        try:
+            await update_crafting_display(interaction, user_id)
+        except Exception as e:
+            log.error("Error updating crafting display after add: %s", e)
+            try:
+                await interaction.followup.send(
+                    "❌ An error occurred while updating the crafting session.", ephemeral=True
+                )
+            except Exception:
+                pass
 
     @app_commands.command(name="remove", description="Remove a card from your crafting session.")
     async def craft_remove(
@@ -168,35 +191,55 @@ class Craft(commands.GroupCog, group_name="craft"):
         await interaction.response.defer(ephemeral=True)
         user_id = interaction.user.id
 
-        if user_id not in crafting_sessions:
+        session = get_session(user_id)
+        if not session:
             await interaction.followup.send("❌ No active crafting session!", ephemeral=True)
             return
 
-        session = crafting_sessions[user_id]
-        if countryball.pk not in session["ingredient_instances"]:
+        if countryball.pk not in session.ingredient_instances:
             await interaction.followup.send(
                 f"❌ Instance #{countryball.pk:0X} not in your session!", ephemeral=True
             )
             return
 
-        ball = await countryball.ball  # type: ignore
-        session["ingredient_instances"].remove(countryball.pk)
+        ball = countryball.ball  # type: ignore
+        session.ingredient_instances.remove(countryball.pk)
         await interaction.followup.send(
             f"Removed {ball.country} #{countryball.pk:0X} from crafting session!", ephemeral=True
         )
-        await update_crafting_display(interaction, user_id)
+        try:
+            await update_crafting_display(interaction, user_id)
+        except Exception as e:
+            log.error("Error updating crafting display after remove: %s", e)
+            try:
+                await interaction.followup.send(
+                    "❌ An error occurred while updating the crafting session.", ephemeral=True
+                )
+            except Exception:
+                pass
 
     @app_commands.command(name="clear", description="Clear all ingredients from your crafting session.")
     async def craft_clear(self, interaction: discord.Interaction):
         user_id = interaction.user.id
 
-        if user_id not in crafting_sessions:
+        session = get_session(user_id)
+        if not session:
             await interaction.response.send_message("❌ No active crafting session!", ephemeral=True)
             return
 
-        crafting_sessions[user_id]["ingredient_instances"] = []
+        session.ingredient_instances = []
         await interaction.response.defer()
-        await update_crafting_display(interaction, user_id)
+        try:
+            await interaction.followup.send("✅ Cleared all ingredients from your crafting session!", ephemeral=True)
+            await update_crafting_display(interaction, user_id)
+        except Exception as e:
+            log.error("Error in craft_clear: %s", e)
+            try:
+                await interaction.followup.send(
+                    "❌ An error occurred while updating the crafting session.", ephemeral=True
+                )
+            except Exception:
+                pass
 
     @app_commands.command(name="recipes", description="Browse recipes and quick-craft if you have the ingredients.")
     async def craft_recipes(
@@ -222,8 +265,7 @@ class Craft(commands.GroupCog, group_name="craft"):
             return
 
         player, _ = await Player.objects.aget_or_create(discord_id=interaction.user.id)
-        inventory = await load_craft_inventory(player)
-        counts = inventory_counts(inventory)
+        counts = await load_craft_inventory(player)
         statuses = await build_recipe_statuses(recipes, counts)
         statuses.sort(key=lambda s: (not s.ready, s.recipe.result.country.lower()))
 
