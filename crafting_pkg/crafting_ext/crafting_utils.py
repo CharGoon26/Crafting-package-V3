@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
+
 import discord
 
 from bd_models.models import BallInstance
 
 from .crafting_views import CraftingView
 from .logic import find_matching_recipes
-from .session_manager import crafting_sessions
+from .session_manager import get_session
+
+log = logging.getLogger("ballsdex.packages.crafting")
 
 
 def _chunk_embed_lines(lines: list[str], *, max_length: int = 900, max_chunks: int = 10) -> list[str]:
@@ -39,29 +43,32 @@ def _chunk_embed_lines(lines: list[str], *, max_length: int = 900, max_chunks: i
 
 async def update_crafting_display(interaction: discord.Interaction, user_id: int, is_new: bool = False):
     """Update the crafting session embed."""
-    session = crafting_sessions[user_id]
+    session = get_session(user_id)
+    if not session:
+        return
 
     ball_instances = []
-    if session["ingredient_instances"]:
+    if session.ingredient_instances:
         try:
             async for inst in BallInstance.objects.filter(
-                id__in=session["ingredient_instances"]
+                id__in=session.ingredient_instances
             ).select_related("ball", "special"):
                 ball_instances.append(inst)
         except Exception as e:
-            print(f"Error fetching ball instances: {e}")
+            log.error("Error fetching ball instances: %s", e)
             return
 
-    possible_recipes = await find_matching_recipes(session["ingredient_instances"])
+    count, possible_recipes = await find_matching_recipes(session.ingredient_instances)
 
     embed = discord.Embed(title="🔨 Crafting Session", color=0x0099FF)
 
     if possible_recipes:
         results = []
-        for recipe in possible_recipes[:5]:
+        for recipe in possible_recipes:
             emoji = interaction.client.get_emoji(recipe.result.emoji_id)
-            results.append(f"{emoji} {recipe.result.country}")
-        extra = f"\n*+{len(possible_recipes) - 5} more*" if len(possible_recipes) > 5 else ""
+            emoji_str = str(emoji) if emoji else ''
+            results.append(f"{emoji_str} {recipe.result.country}".strip())
+        extra = f"\n*+{count - len(possible_recipes)} more*" if count > len(possible_recipes) else ""
         embed.add_field(name="✅ Can Craft", value="\n".join(results) + extra, inline=False)
     else:
         embed.add_field(
@@ -74,9 +81,10 @@ async def update_crafting_display(interaction: discord.Interaction, user_id: int
         lines = []
         for inst in ball_instances:
             emoji = interaction.client.get_emoji(inst.ball.emoji_id)
+            emoji_str = str(emoji) if emoji else ''
             special_text = f"{inst.special.emoji} " if inst.special_id else ""
             lines.append(
-                f"{emoji} {special_text}{inst.ball.country} #{inst.pk:0X} "
+                f"{emoji_str} {special_text}{inst.ball.country} #{inst.pk:0X} "
                 f"(ATK: {inst.attack_bonus:+d}, HP: {inst.health_bonus:+d})"
             )
         for index, chunk in enumerate(_chunk_embed_lines(lines), start=1):
@@ -111,23 +119,19 @@ async def update_crafting_display(interaction: discord.Interaction, user_id: int
 
     embed.set_footer(text="Session expires after 20 minutes of inactivity")
 
-    view = CraftingView(interaction.client, session["player"], session)
+    view = CraftingView(interaction.client, session.player, session)
 
     if is_new:
         message = await interaction.followup.send("Crafting session:", embed=embed, view=view)
-        session["message"] = message
+        session.message = message
         return
 
     try:
-        if session.get("message"):
-            await session["message"].edit(embed=embed, view=view)
+        if session.message:
+            await session.message.edit(embed=embed, view=view)
         else:
             new_message = await interaction.followup.send("Updated crafting session:", embed=embed, view=view)
-            session["message"] = new_message
+            session.message = new_message
     except Exception as e:
-        print(f"Error updating crafting display: {e}")
-        try:
-            new_message = await interaction.followup.send("Updated crafting session:", embed=embed, view=view)
-            session["message"] = new_message
-        except Exception as e2:
-            print(f"Error sending followup: {e2}")
+        log.error("Error updating crafting display: %s", e)
+        raise
