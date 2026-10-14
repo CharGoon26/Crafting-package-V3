@@ -1,45 +1,34 @@
 from __future__ import annotations
 
+import asyncio
 import datetime
-import threading
-import traceback
+import logging
 from typing import Dict, List, Optional
+
+from cachetools import TTLCache
+
+log = logging.getLogger("ballsdex.packages.crafting.session")
 
 
 class CraftingSessionData:
+    """Session data for a single user's crafting session."""
+
+    __slots__ = ("player", "ingredient_instances", "created_at", "last_accessed", "access_count", "_lock", "message")
+
     def __init__(self, player, ingredient_instances: List[int]):
         self.player = player
         self.ingredient_instances = ingredient_instances.copy()
         self.created_at = datetime.datetime.now()
         self.last_accessed = datetime.datetime.now()
         self.access_count = 0
-        self.debug_log = []
-        self._lock = threading.Lock()
-
-    def log_access(self, operation: str, details: str = ""):
-        with self._lock:
-            self.last_accessed = datetime.datetime.now()
-            self.access_count += 1
-            stack = traceback.extract_stack()
-            caller_info = f"{stack[-3].filename}:{stack[-3].lineno}" if len(stack) >= 3 else "unknown"
-            self.debug_log.append({
-                "timestamp": datetime.datetime.now().isoformat(),
-                "operation": operation,
-                "details": details,
-                "caller": caller_info,
-                "ingredient_count": len(self.ingredient_instances),
-                "access_count": self.access_count,
-            })
-            print(
-                f"[SESSION {self.player.id}] {operation}: {details} "
-                f"(ingredients: {len(self.ingredient_instances)}) from {caller_info}"
-            )
+        self._lock = asyncio.Lock()
+        self.message = None
 
     def to_dict(self) -> Dict:
-        self.log_access("CONVERTED_TO_DICT", "Session data accessed")
         return {
             "player": self.player,
             "ingredient_instances": self.ingredient_instances.copy(),
+            "message": self.message,
         }
 
     def is_valid(self) -> tuple[bool, str]:
@@ -50,76 +39,117 @@ class CraftingSessionData:
         return True, "Valid"
 
     def remove_ingredients(self, instance_ids: List[int]) -> bool:
-        with self._lock:
-            try:
-                removed = 0
-                for iid in instance_ids:
-                    if iid in self.ingredient_instances:
-                        self.ingredient_instances.remove(iid)
-                        removed += 1
-                self.log_access("INGREDIENTS_REMOVED", f"Removed {removed}, {len(self.ingredient_instances)} remaining")
-                return True
-            except Exception as e:
-                self.log_access("INGREDIENT_REMOVAL_FAILED", f"Error: {e}")
-                return False
+        try:
+            removed = 0
+            for iid in instance_ids:
+                if iid in self.ingredient_instances:
+                    self.ingredient_instances.remove(iid)
+                    removed += 1
+            log.debug(
+                "[SESSION %s] INGREDIENTS_REMOVED: Removed %d, %d remaining",
+                self.player.id,
+                removed,
+                len(self.ingredient_instances),
+            )
+            return True
+        except Exception as e:
+            log.exception("[SESSION %s] INGREDIENT_REMOVAL_FAILED: %s", self.player.id, e)
+            return False
 
-    def print_debug_log(self):
-        print(f"[SESSION {self.player.id}] DEBUG LOG:")
-        for entry in self.debug_log:
-            print(f"  {entry['timestamp']}: {entry['operation']} - {entry['details']} (from {entry['caller']})")
 
+# Use TTLCache with 30 min TTL and max 10000 sessions
+# This automatically evicts expired entries on access
+_session_storage: TTLCache[int, CraftingSessionData] = TTLCache(maxsize=10000, ttl=1800)
 
-_session_storage: Dict[int, CraftingSessionData] = {}
+# Background cleanup task reference
+_cleanup_task: Optional[asyncio.Task] = None
 
 
 def create_session(user_id: int, player, ingredient_instances: List[int]) -> bool:
     try:
         if user_id in _session_storage:
-            _session_storage[user_id].log_access("SESSION_REPLACED", "Creating new session")
+            log.warning("Replacing existing crafting session for user %d", user_id)
         session = CraftingSessionData(player, ingredient_instances)
-        session.log_access("SESSION_CREATED", f"Initial ingredients: {len(ingredient_instances)}")
         _session_storage[user_id] = session
+        log.debug("[SESSION %s] SESSION_CREATED: Initial ingredients: %d", player.id, len(ingredient_instances))
         return True
     except Exception as e:
-        print(f"[SESSION_MANAGER] Failed to create session for user {user_id}: {e}")
+        log.exception("[SESSION_MANAGER] Failed to create session for user %s: %s", user_id, e)
         return False
 
 
-def get_session(user_id: int) -> Optional[Dict]:
-    if user_id not in _session_storage:
+def get_session(user_id: int) -> Optional[CraftingSessionData]:
+    session = _session_storage.get(user_id)
+    if session is None:
         return None
-    session = _session_storage[user_id]
     is_valid, reason = session.is_valid()
     if not is_valid:
-        del _session_storage[user_id]
+        # TTLCache should have evicted, but double-check
+        _session_storage.pop(user_id, None)
         return None
-    session.log_access("SESSION_ACCESSED", "Session data retrieved")
-    return session.to_dict()
+    return session
 
 
 def end_session(user_id: int, reason: str = "Manual") -> bool:
     if user_id not in _session_storage:
         return False
-    _session_storage[user_id].log_access("SESSION_ENDED", f"Reason: {reason}")
-    del _session_storage[user_id]
+    log.debug("[SESSION %s] SESSION_ENDED: Reason: %s", user_id, reason)
+    _session_storage.pop(user_id, None)
     return True
 
 
 def session_exists(user_id: int) -> bool:
-    if user_id not in _session_storage:
+    session = _session_storage.get(user_id)
+    if session is None:
         return False
-    is_valid, _ = _session_storage[user_id].is_valid()
+    is_valid, _ = session.is_valid()
     if not is_valid:
-        del _session_storage[user_id]
+        _session_storage.pop(user_id, None)
         return False
     return True
 
 
-def cleanup_expired_sessions() -> int:
-    expired = [uid for uid, s in _session_storage.items() if not s.is_valid()[0]]
-    for uid in expired:
-        del _session_storage[uid]
-    return len(expired)
+async def cleanup_expired_sessions() -> int:
+    """Manual cleanup - mostly for metrics since TTLCache handles expiration."""
+    before = len(_session_storage)
+    # Access all items to trigger TTL eviction
+    for uid in list(_session_storage.keys()):
+        _ = _session_storage.get(uid)
+    after = len(_session_storage)
+    cleaned = before - after
+    if cleaned:
+        log.info("Crafting session cleanup: removed %d expired sessions", cleaned)
+    return cleaned
 
 
+async def start_cleanup_task(interval: int = 300) -> asyncio.Task:
+    """Start background cleanup task."""
+    async def _cleanup_loop():
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await cleanup_expired_sessions()
+            except Exception:
+                log.exception("Error in crafting session cleanup task")
+
+    global _cleanup_task
+    if _cleanup_task is None or _cleanup_task.done():
+        _cleanup_task = asyncio.create_task(_cleanup_loop())
+        log.info("Crafting session cleanup task started (interval=%ds)", interval)
+    return _cleanup_task
+
+
+async def stop_cleanup_task() -> None:
+    """Stop background cleanup task."""
+    global _cleanup_task
+    if _cleanup_task and not _cleanup_task.done():
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+        log.info("Crafting session cleanup task stopped")
+
+
+# Export for backward compatibility
 crafting_sessions = _session_storage
